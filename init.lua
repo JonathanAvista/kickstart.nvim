@@ -530,8 +530,6 @@ do
     gh 'nvim-lua/plenary.nvim',
     gh 'nvim-telescope/telescope.nvim',
     gh 'nvim-telescope/telescope-ui-select.nvim',
-    -- Telescope LSP pickers for OmniSharp that can open $metadata$ (decompiled) documents
-    gh 'Hoffs/omnisharp-extended-lsp.nvim',
   }
   if vim.fn.executable 'make' == 1 then table.insert(telescope_plugins, gh 'nvim-telescope/telescope-fzf-native.nvim') end
 
@@ -579,32 +577,17 @@ do
     callback = function(event)
       local buf = event.buf
 
-      -- For symbols in NuGet/framework assemblies, OmniSharp answers with `$metadata$` URIs that the stock
-      -- Telescope pickers cannot open. On OmniSharp buffers, the four jump pickers below come from
-      -- omnisharp-extended instead; it fetches the decompiled source first. Anything else falls through to `builtin`.
-      local pickers = builtin
-      local client = vim.lsp.get_client_by_id(event.data.client_id)
-      if client and client.name == 'omnisharp' then
-        local omnisharp_extended = require 'omnisharp_extended'
-        pickers = setmetatable({
-          lsp_references = function() omnisharp_extended.telescope_lsp_references() end,
-          lsp_implementations = function() omnisharp_extended.telescope_lsp_implementation() end,
-          lsp_definitions = function() omnisharp_extended.telescope_lsp_definition() end,
-          lsp_type_definitions = function() omnisharp_extended.telescope_lsp_type_definition() end,
-        }, { __index = builtin })
-      end
-
       -- Find references for the word under your cursor.
-      vim.keymap.set('n', 'grr', pickers.lsp_references, { buffer = buf, desc = '[G]oto [R]eferences' })
+      vim.keymap.set('n', 'grr', builtin.lsp_references, { buffer = buf, desc = '[G]oto [R]eferences' })
 
       -- Jump to the implementation of the word under your cursor.
       -- Useful when your language has ways of declaring types without an actual implementation.
-      vim.keymap.set('n', 'gri', pickers.lsp_implementations, { buffer = buf, desc = '[G]oto [I]mplementation' })
+      vim.keymap.set('n', 'gri', builtin.lsp_implementations, { buffer = buf, desc = '[G]oto [I]mplementation' })
 
       -- Jump to the definition of the word under your cursor.
       -- This is where a variable was first declared, or where a function is defined, etc.
       -- To jump back, press <C-t>.
-      vim.keymap.set('n', 'grd', pickers.lsp_definitions, { buffer = buf, desc = '[G]oto [D]efinition' })
+      vim.keymap.set('n', 'grd', builtin.lsp_definitions, { buffer = buf, desc = '[G]oto [D]efinition' })
 
       -- Fuzzy find all the symbols in your current document.
       -- Symbols are things like variables, functions, types, etc.
@@ -617,7 +600,7 @@ do
       -- Jump to the type of the word under your cursor.
       -- Useful when you're not sure what type a variable is and you want to see
       -- the definition of its *type*, not where it was *defined*.
-      vim.keymap.set('n', 'grt', pickers.lsp_type_definitions, { buffer = buf, desc = '[G]oto [T]ype Definition' })
+      vim.keymap.set('n', 'grt', builtin.lsp_type_definitions, { buffer = buf, desc = '[G]oto [T]ype Definition' })
     end,
   })
 
@@ -754,52 +737,11 @@ do
   -- Enable the following language servers
   --  Feel free to add/remove any LSPs that you want here. They will automatically be installed.
   --  See `:help lsp-config` for information about keys and how to configure
-  -- On Windows, Mason's `OmniSharp.cmd` shim runs `dotnet OmniSharp.dll`, so Neovim's child process is
-  -- cmd.exe. When Neovim quits, it ends cmd.exe and the real server keeps running: one orphaned ~350 MB
-  -- OmniSharp plus its MSBuild nodes per session. OmniSharp's own --hostPID watchdog did not clean them up
-  -- (measured 2026-10-12). Launching Mason's OmniSharp.exe directly makes Neovim own the server process.
-  -- The path is spelled out because Mason is set up further down, so its bin/ is not on PATH here yet.
-  local omnisharp_exe = vim.fs.joinpath(vim.fn.stdpath 'data', 'mason', 'packages', 'omnisharp', 'libexec', 'OmniSharp.exe')
-  if vim.fn.has 'win32' == 0 or vim.fn.executable(omnisharp_exe) == 0 then omnisharp_exe = 'OmniSharp' end
-
+  --
+  --  C# is not in this table: roslyn.nvim (below the Mason setup) configures and enables its own `roslyn` server.
   ---@type table<string, vim.lsp.Config>
   local servers = {
     clangd = {},
-
-    -- C# (Mason package `omnisharp`, OmniSharp-roslyn 1.39.15)
-    omnisharp = {
-      -- Same arguments as nvim-lspconfig's `lsp/omnisharp.lua` (the executable is `omnisharp_exe`, above), plus
-      -- OmniSharp `Section:Key=value` overrides.
-      -- They go on the command line rather than in `settings` because OmniSharp discovers and loads
-      -- projects at process start, before any LSP configuration message arrives.
-      cmd = {
-        omnisharp_exe,
-        '-z', -- https://github.com/OmniSharp/omnisharp-vscode/pull/4300
-        '--hostPID',
-        tostring(vim.fn.getpid()),
-        'DotNet:enablePackageRestore=false',
-        -- lspconfig roots OmniSharp at the nearest *.slnx, but 1.39.15 cannot read .slnx. It then loads
-        -- every .csproj under that root: in aviCore that was 191 projects, including the build copies under
-        -- artifacts/ (measured from lsp.log, 2026-10-12), and `grr` answered "No symbol found".
-        -- On demand loads only the projects of files you open, plus their references.
-        -- Trade-off: references are only found in projects that have been loaded.
-        'MsBuild:LoadProjectsOnDemand=true',
-        -- Lets go-to-definition land in decompiled NuGet/framework code ($metadata$ documents). Telescope
-        -- can only open those through omnisharp-extended (see the Telescope LspAttach mappings).
-        'RoslynExtensionsOptions:EnableDecompilationSupport=true',
-        -- Offer types from namespaces that are not imported yet; accepting one adds the `using`.
-        'RoslynExtensionsOptions:EnableImportCompletion=true',
-        '--encoding',
-        'utf-8',
-        '--languageserver',
-      },
-      on_init = function(client)
-        -- OmniSharp throws `ArgumentOutOfRangeException: Range must not span multiple lines` on every
-        -- semantic-token request (seen on every aviCore file). Treesitter already highlights C#.
-        client.server_capabilities.semanticTokensProvider = nil
-      end,
-    },
-
     -- gopls = {},
     pyright = {},
     -- tsc = {},
@@ -853,7 +795,15 @@ do
   }
 
   -- Automatically install LSPs and related tools to stdpath for Neovim
-  require('mason').setup {}
+  require('mason').setup {
+    registries = {
+      'github:mason-org/mason-registry',
+      -- Provides the `roslyn` package: the Roslyn C# server build VS Code ships (5.13.0-1.26507.4 on
+      -- 2026-10-12). mason-org's own `roslyn-language-server` was 5.12.0-1.26426.8, older than the
+      -- 5.12.0-1.26453.19 that roslyn.nvim's `--daemon-mode` needs.
+      'github:Crashdummyy/mason-registry',
+    },
+  }
 
   -- Translates between nvim-lspconfig server names and mason.nvim package names (e.g. lua_ls <-> lua-language-server)
   require('mason-lspconfig').setup {
@@ -870,6 +820,7 @@ do
   local ensure_installed = vim.tbl_keys(servers or {})
   vim.list_extend(ensure_installed, {
     -- You can add other tools here that you want Mason to install
+    'roslyn', -- C# language server, used by roslyn.nvim below (Crashdummyy registry)
     'csharpier', -- C# formatter, used by conform below
   })
 
@@ -879,6 +830,82 @@ do
     vim.lsp.config(name, server)
     vim.lsp.enable(name)
   end
+
+  -- [[ C# ]]
+  -- Microsoft's Roslyn language server (the one VS Code's C# extension runs), driven by roslyn.nvim, which
+  -- enables the `roslyn` server itself. It replaced OmniSharp because OmniSharp 1.39.15 cannot open .slnx:
+  -- measured 2026-10-12, `-s aviCoreExplorer.slnx` loaded 0 projects in 5 minutes; `rIoTEngineCore.sln` loaded 16 in 25 s.
+  --
+  -- How a C# buffer picks its solution:
+  --   1. the nearest .sln/.slnx/.slnf above the file that lists the file's .csproj (more than one: run `:Roslyn target`)
+  --   2. otherwise the selected solution (`vim.g.roslyn_nvim_selected_solution`). :CsSolution and :Roslyn target
+  --      set it, and so does entering any C# buffer that already has a solution.
+  --   3. otherwise (nothing selected yet) the .csproj on its own, plus its project references
+  -- In aviCore, Explorer files resolve to aviCoreExplorer.slnx automatically. Engine files are in no solution
+  -- above them, so an engine file opened after an Explorer file joins the Explorer solution as a loose file
+  -- (measured 2026-10-12). Run :CsSolution and pick rIoTEngineCore.sln to load the engine solution instead.
+  vim.pack.add { gh 'seblyng/roslyn.nvim' }
+  require('roslyn').setup {
+    -- Off on purpose: broad search also looks for solutions *below* the git root. On aviCore that scan took
+    -- 1.5 s per C# buffer and returned 121 solutions, 60 of them build copies under artifacts/ (measured
+    -- 2026-10-12). :CsSolution lists only git-tracked solutions instead.
+    broad_search = false,
+  }
+  vim.lsp.config('roslyn', {
+    settings = {
+      ['csharp|completion'] = {
+        -- Offer types from namespaces that are not imported yet; accepting one adds the `using`.
+        dotnet_show_completion_items_from_unimported_namespaces = true,
+      },
+    },
+  })
+
+  -- :CsSolution: pick any git-tracked solution and load it, like Visual Studio's File > Open Solution.
+  -- `:Roslyn target` only offers solutions above the current file, so from rIoTEngine/ it can never reach
+  -- rIoTEngineCore/rIoTEngineCore.sln, which sits in a sibling folder. `git ls-files` skips gitignored build copies.
+  -- The restart below mirrors `:Roslyn target` in roslyn.nvim's lua/roslyn/commands.lua; keep the two in step
+  -- when roslyn.nvim is updated.
+  vim.api.nvim_create_user_command('CsSolution', function()
+    local root = vim.fs.root(0, '.git') or vim.fn.getcwd()
+    local listed = vim.fn.systemlist { 'git', '-C', root, 'ls-files', '*.sln', '*.slnx', '*.slnf' }
+    if vim.v.shell_error ~= 0 or #listed == 0 then
+      vim.notify('No git-tracked solutions under ' .. root, vim.log.levels.WARN)
+      return
+    end
+
+    vim.ui.select(vim.tbl_map(function(path) return vim.fs.joinpath(root, path) end, listed), {
+      prompt = 'C# solution',
+      format_item = function(path) return vim.fs.relpath(root, path) or path end,
+    }, function(solution)
+      if not solution then return end
+      -- Used by C# buffers that no nearer solution claims (step 2 above).
+      require('roslyn.store').set_selected_target(solution)
+
+      local bufnr = vim.api.nvim_get_current_buf()
+      if vim.bo[bufnr].filetype ~= 'cs' then
+        vim.notify('Roslyn will load ' .. vim.fs.basename(solution) .. ' when you open a C# file from it')
+        return
+      end
+
+      local config = vim.tbl_deep_extend('force', vim.lsp.config['roslyn'], {
+        root_dir = vim.fs.dirname(solution),
+        on_init = function(client) require('roslyn.lsp.on_init').sln(client, solution) end,
+      })
+      local client = vim.lsp.get_clients({ name = 'roslyn', bufnr = bufnr })[1]
+      if not client then
+        vim.lsp.start(config, { bufnr = bufnr })
+        return
+      end
+      local remove_listener
+      remove_listener = require('roslyn.roslyn_emitter').on('stopped', function()
+        remove_listener()
+        vim.lsp.start(config, { bufnr = bufnr })
+      end)
+      -- Force on Windows, as `:Roslyn target` does. Either way Neovim then reports "Client roslyn quit with exit
+      -- code 1": the daemon-mode relay exits with 1 even on a graceful stop (measured 2026-10-12). It is harmless.
+      client:stop(vim.fn.has 'win32' == 1)
+    end)
+  end, { desc = 'Choose the C# solution Roslyn loads' })
 end
 
 -- ============================================================
