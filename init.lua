@@ -530,6 +530,8 @@ do
     gh 'nvim-lua/plenary.nvim',
     gh 'nvim-telescope/telescope.nvim',
     gh 'nvim-telescope/telescope-ui-select.nvim',
+    -- Telescope LSP pickers for OmniSharp that can open $metadata$ (decompiled) documents
+    gh 'Hoffs/omnisharp-extended-lsp.nvim',
   }
   if vim.fn.executable 'make' == 1 then table.insert(telescope_plugins, gh 'nvim-telescope/telescope-fzf-native.nvim') end
 
@@ -577,17 +579,32 @@ do
     callback = function(event)
       local buf = event.buf
 
+      -- For symbols in NuGet/framework assemblies, OmniSharp answers with `$metadata$` URIs that the stock
+      -- Telescope pickers cannot open. On OmniSharp buffers, the four jump pickers below come from
+      -- omnisharp-extended instead; it fetches the decompiled source first. Anything else falls through to `builtin`.
+      local pickers = builtin
+      local client = vim.lsp.get_client_by_id(event.data.client_id)
+      if client and client.name == 'omnisharp' then
+        local omnisharp_extended = require 'omnisharp_extended'
+        pickers = setmetatable({
+          lsp_references = function() omnisharp_extended.telescope_lsp_references() end,
+          lsp_implementations = function() omnisharp_extended.telescope_lsp_implementation() end,
+          lsp_definitions = function() omnisharp_extended.telescope_lsp_definition() end,
+          lsp_type_definitions = function() omnisharp_extended.telescope_lsp_type_definition() end,
+        }, { __index = builtin })
+      end
+
       -- Find references for the word under your cursor.
-      vim.keymap.set('n', 'grr', builtin.lsp_references, { buffer = buf, desc = '[G]oto [R]eferences' })
+      vim.keymap.set('n', 'grr', pickers.lsp_references, { buffer = buf, desc = '[G]oto [R]eferences' })
 
       -- Jump to the implementation of the word under your cursor.
       -- Useful when your language has ways of declaring types without an actual implementation.
-      vim.keymap.set('n', 'gri', builtin.lsp_implementations, { buffer = buf, desc = '[G]oto [I]mplementation' })
+      vim.keymap.set('n', 'gri', pickers.lsp_implementations, { buffer = buf, desc = '[G]oto [I]mplementation' })
 
       -- Jump to the definition of the word under your cursor.
       -- This is where a variable was first declared, or where a function is defined, etc.
       -- To jump back, press <C-t>.
-      vim.keymap.set('n', 'grd', builtin.lsp_definitions, { buffer = buf, desc = '[G]oto [D]efinition' })
+      vim.keymap.set('n', 'grd', pickers.lsp_definitions, { buffer = buf, desc = '[G]oto [D]efinition' })
 
       -- Fuzzy find all the symbols in your current document.
       -- Symbols are things like variables, functions, types, etc.
@@ -600,7 +617,7 @@ do
       -- Jump to the type of the word under your cursor.
       -- Useful when you're not sure what type a variable is and you want to see
       -- the definition of its *type*, not where it was *defined*.
-      vim.keymap.set('n', 'grt', builtin.lsp_type_definitions, { buffer = buf, desc = '[G]oto [T]ype Definition' })
+      vim.keymap.set('n', 'grt', pickers.lsp_type_definitions, { buffer = buf, desc = '[G]oto [T]ype Definition' })
     end,
   })
 
@@ -737,10 +754,52 @@ do
   -- Enable the following language servers
   --  Feel free to add/remove any LSPs that you want here. They will automatically be installed.
   --  See `:help lsp-config` for information about keys and how to configure
+  -- On Windows, Mason's `OmniSharp.cmd` shim runs `dotnet OmniSharp.dll`, so Neovim's child process is
+  -- cmd.exe. When Neovim quits, it ends cmd.exe and the real server keeps running: one orphaned ~350 MB
+  -- OmniSharp plus its MSBuild nodes per session. OmniSharp's own --hostPID watchdog did not clean them up
+  -- (measured 2026-10-12). Launching Mason's OmniSharp.exe directly makes Neovim own the server process.
+  -- The path is spelled out because Mason is set up further down, so its bin/ is not on PATH here yet.
+  local omnisharp_exe = vim.fs.joinpath(vim.fn.stdpath 'data', 'mason', 'packages', 'omnisharp', 'libexec', 'OmniSharp.exe')
+  if vim.fn.has 'win32' == 0 or vim.fn.executable(omnisharp_exe) == 0 then omnisharp_exe = 'OmniSharp' end
+
   ---@type table<string, vim.lsp.Config>
   local servers = {
     clangd = {},
-    omnisharp = {},
+
+    -- C# (Mason package `omnisharp`, OmniSharp-roslyn 1.39.15)
+    omnisharp = {
+      -- Same arguments as nvim-lspconfig's `lsp/omnisharp.lua` (the executable is `omnisharp_exe`, above), plus
+      -- OmniSharp `Section:Key=value` overrides.
+      -- They go on the command line rather than in `settings` because OmniSharp discovers and loads
+      -- projects at process start, before any LSP configuration message arrives.
+      cmd = {
+        omnisharp_exe,
+        '-z', -- https://github.com/OmniSharp/omnisharp-vscode/pull/4300
+        '--hostPID',
+        tostring(vim.fn.getpid()),
+        'DotNet:enablePackageRestore=false',
+        -- lspconfig roots OmniSharp at the nearest *.slnx, but 1.39.15 cannot read .slnx. It then loads
+        -- every .csproj under that root: in aviCore that was 191 projects, including the build copies under
+        -- artifacts/ (measured from lsp.log, 2026-10-12), and `grr` answered "No symbol found".
+        -- On demand loads only the projects of files you open, plus their references.
+        -- Trade-off: references are only found in projects that have been loaded.
+        'MsBuild:LoadProjectsOnDemand=true',
+        -- Lets go-to-definition land in decompiled NuGet/framework code ($metadata$ documents). Telescope
+        -- can only open those through omnisharp-extended (see the Telescope LspAttach mappings).
+        'RoslynExtensionsOptions:EnableDecompilationSupport=true',
+        -- Offer types from namespaces that are not imported yet; accepting one adds the `using`.
+        'RoslynExtensionsOptions:EnableImportCompletion=true',
+        '--encoding',
+        'utf-8',
+        '--languageserver',
+      },
+      on_init = function(client)
+        -- OmniSharp throws `ArgumentOutOfRangeException: Range must not span multiple lines` on every
+        -- semantic-token request (seen on every aviCore file). Treesitter already highlights C#.
+        client.server_capabilities.semanticTokensProvider = nil
+      end,
+    },
+
     -- gopls = {},
     pyright = {},
     -- tsc = {},
@@ -811,6 +870,7 @@ do
   local ensure_installed = vim.tbl_keys(servers or {})
   vim.list_extend(ensure_installed, {
     -- You can add other tools here that you want Mason to install
+    'csharpier', -- C# formatter, used by conform below
   })
 
   require('mason-tool-installer').setup { ensure_installed = ensure_installed }
@@ -842,11 +902,22 @@ do
         return nil
       end
     end,
+    -- C# is formatted *after* the save, not in format_on_save. Measured 2026-10-12: CSharpier takes
+    -- ~0.5 s on a tiny file and ~1.3 s on a 7 KB aviCore file, because each run starts a fresh process.
+    -- That is past format_on_save's 500 ms, which then skips it ("Formatter 'csharpier' timeout").
+    -- After-save runs it asynchronously and writes the buffer again when it finishes, so the editor never blocks.
+    format_after_save = function(bufnr)
+      if vim.bo[bufnr].filetype == 'cs' then return {} end
+      return nil
+    end,
     default_format_opts = {
       lsp_format = 'fallback', -- Use external formatters if configured below, otherwise use LSP formatting. Set to `false` to disable LSP formatting entirely.
     },
     -- You can also specify external formatters in here.
     formatters_by_ft = {
+      -- C#'s filetype is `cs`, not `csharp`. CSharpier rewrites the whole file, so the first save of a
+      -- file nobody has formatted with it yet produces a large diff.
+      cs = { 'csharpier' },
       -- rust = { 'rustfmt' },
       -- Conform can also run multiple formatters sequentially
       -- python = { "isort", "black" },

@@ -92,6 +92,10 @@
       "src": "https://github.com/nvim-treesitter/nvim-treesitter",
       "version": "'main'"
     },
+    "omnisharp-extended-lsp.nvim": {
+      "rev": "51e407a46ddb15e49727139b5b1ae3650cd6a069",
+      "src": "https://github.com/Hoffs/omnisharp-extended-lsp.nvim"
+    },
     "plenary.nvim": {
       "rev": "74b06c6c75e4eeb3108ec01852001636d85a932b",
       "src": "https://github.com/nvim-lua/plenary.nvim"
